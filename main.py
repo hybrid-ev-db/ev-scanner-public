@@ -19,6 +19,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 AUTO_SCAN_ENABLED = os.environ.get("AUTO_SCAN_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 AUTO_SCAN_INTERVAL_SECONDS = max(60, int(os.environ.get("AUTO_SCAN_INTERVAL_SECONDS", "300")))
 PRE_KICKOFF_MINUTES = max(5.0, float(os.environ.get("PRE_KICKOFF_MINUTES", "90")))
+MAX_LEAGUES_PER_SCAN = max(1, min(15, int(os.environ.get("MAX_LEAGUES_PER_SCAN", "6"))))
 REGIONS = os.environ.get("ODDS_REGIONS", "uk,eu")
 MARKETS = "h2h,totals,btts"
 
@@ -55,8 +56,55 @@ def format_selection_label(market_key: str, outcome_name: str, point) -> str:
     return outcome_name
 
 
-def fetch_soccer_events() -> list:
+def get_active_soccer_leagues() -> list:
     headers = {"Accept": "application/json"}
+    resp = requests.get(
+        "https://api.the-odds-api.com/v4/sports",
+        params={"apiKey": ODDS_API_KEY},
+        headers=headers,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    sports = resp.json()
+    if not isinstance(sports, list):
+        return []
+
+    priority_prefixes = (
+        "soccer_epl",
+        "soccer_spain_la_liga",
+        "soccer_italy_serie_a",
+        "soccer_germany_bundesliga",
+        "soccer_france_ligue_one",
+        "soccer_uefa_champs_league",
+        "soccer_uefa_europa_league",
+    )
+
+    active_soccer = []
+    for s in sports:
+        key = str(s.get("key", ""))
+        if s.get("active") and key.startswith("soccer_"):
+            active_soccer.append(
+                {
+                    "key": key,
+                    "title": s.get("title") or key,
+                    "group": s.get("group") or "Soccer",
+                }
+            )
+
+    active_soccer.sort(
+        key=lambda item: (
+            0 if any(item["key"].startswith(p) for p in priority_prefixes) else 1,
+            item["key"],
+        )
+    )
+    return active_soccer[:MAX_LEAGUES_PER_SCAN]
+
+
+def fetch_soccer_events() -> tuple:
+    headers = {"Accept": "application/json"}
+    leagues = get_active_soccer_leagues()
+    league_keys = [lg["key"] for lg in leagues]
+
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": REGIONS,
@@ -64,51 +112,36 @@ def fetch_soccer_events() -> list:
         "oddsFormat": "decimal",
     }
 
-    resp = requests.get(
-        "https://api.the-odds-api.com/v4/sports/soccer/odds",
-        params=params,
-        headers=headers,
-        timeout=25,
-    )
-    if resp.status_code == 200:
-        data = resp.json()
-        if isinstance(data, list) and data:
-            return data
-
-    # Fallback: fetch active soccer league keys and query upcoming odds
-    sports_resp = requests.get(
-        "https://api.the-odds-api.com/v4/sports",
-        params={"apiKey": ODDS_API_KEY},
-        headers=headers,
-        timeout=20,
-    )
-    sports_resp.raise_for_status()
-    soccer_keys = [
-        s.get("key")
-        for s in sports_resp.json()
-        if s.get("active") and str(s.get("key", "")).startswith("soccer_")
-    ]
-
     all_events = []
-    for key in soccer_keys[:8]:
-        r = requests.get(
-            f"https://api.the-odds-api.com/v4/sports/{key}/odds",
-            params=params,
-            headers=headers,
-            timeout=20,
-        )
-        if r.status_code == 200 and isinstance(r.json(), list):
-            all_events.extend(r.json())
-    return all_events
+    for key in league_keys:
+        try:
+            r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{key}/odds",
+                params=params,
+                headers=headers,
+                timeout=20,
+            )
+            if r.status_code == 200 and isinstance(r.json(), list):
+                for ev in r.json():
+                    ev.setdefault("sport_key", key)
+                    all_events.append(ev)
+            else:
+                logger.warning("League %s returned status %s", key, r.status_code)
+        except Exception:
+            logger.exception("Failed fetching odds for league %s", key)
+
+    return all_events, league_keys
 
 
 def collect_ev_from_events(events: list, start_time: datetime, end_time: datetime):
     matched_events = []
     ev_picks = []
+    now_utc = datetime.now(timezone.utc)
 
     for event in events:
         home = event.get("home_team", "")
         away = event.get("away_team", "")
+        league = event.get("sport_title") or event.get("sport_key") or "Soccer"
         label = f"{home} vs {away}"
         commence_str = event.get("commence_time", "")
         commence = parse_iso_time(commence_str)
@@ -117,12 +150,13 @@ def collect_ev_from_events(events: list, start_time: datetime, end_time: datetim
             continue
 
         minutes_to_kickoff = (
-            round((commence - datetime.now(timezone.utc)).total_seconds() / 60.0, 1)
+            round((commence - now_utc).total_seconds() / 60.0, 1)
             if commence
             else None
         )
         matched_events.append(
             {
+                "league": league,
                 "match": label,
                 "commence_time": commence_str,
                 "minutes_to_kickoff": minutes_to_kickoff,
@@ -170,6 +204,7 @@ def collect_ev_from_events(events: list, start_time: datetime, end_time: datetim
                     ev_pct = ((price * fair_p) - 1.0) * 100.0
                     if ev_pct > 0:
                         pick = {
+                            "league": league,
                             "match": label,
                             "commence_time": commence_str,
                             "minutes_to_kickoff": minutes_to_kickoff,
@@ -184,6 +219,9 @@ def collect_ev_from_events(events: list, start_time: datetime, end_time: datetim
                             pick["line"] = point
                         ev_picks.append(pick)
 
+    matched_events.sort(
+        key=lambda x: x["minutes_to_kickoff"] if x["minutes_to_kickoff"] is not None else 999999
+    )
     ev_picks.sort(key=lambda x: x["ev_percent"], reverse=True)
     return matched_events, ev_picks
 
@@ -221,7 +259,7 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
     minutes_limit = PRE_KICKOFF_MINUTES if window_minutes is None else max(5.0, float(window_minutes))
 
     with _scan_lock:
-        events = fetch_soccer_events()
+        events, leagues_scanned = fetch_soccer_events()
         now = datetime.now(timezone.utc)
         window_start = now
         primary_cutoff = now + timedelta(minutes=minutes_limit)
@@ -240,13 +278,14 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
             if ev_picks:
                 top = ev_picks[0]
                 msg = (
-                    f"+EV Pick ({top['market'].upper()} | {used_window}): {top['selection']} in {top['match']} "
-                    f"@ {top['odds']} on {top['bookmaker']} (+{top['ev_percent']}% EV, fair ~{top['fair_odds']})"
+                    f"+EV Pick ({top['league']} | {top['market'].upper()} | {used_window}): "
+                    f"{top['selection']} in {top['match']} @ {top['odds']} on {top['bookmaker']} "
+                    f"(+{top['ev_percent']}% EV, fair ~{top['fair_odds']})"
                 )
             else:
                 msg = (
                     f"Pre-kickoff scan ({used_window}): {len(matched_events)} matches checked across "
-                    f"1X2, Totals & BTTS — no +EV picks right now."
+                    f"{len(leagues_scanned)} leagues (1X2, Totals & BTTS) — no +EV picks right now."
                 )
             send_telegram(msg)
 
@@ -254,10 +293,11 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
             "status": "ok",
             "checked_at": now.isoformat(),
             "window_used": used_window,
+            "leagues_scanned": leagues_scanned,
             "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
             "matched_events_count": len(matched_events),
             "ev_selections_count": len(ev_picks),
-            "matched_events": matched_events[:25],
+            "matched_events": matched_events[:30],
             "ev_selections": ev_picks[:30],
         }
         _last_scan_result = result
@@ -265,7 +305,6 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
 
 
 def _background_scanner_loop() -> None:
-    # Brief pause on boot so Gunicorn finishes binding to port first
     time.sleep(10)
     while AUTO_SCAN_ENABLED:
         try:
@@ -300,12 +339,14 @@ def app(environ, start_response):
                 "auto_scan_enabled": AUTO_SCAN_ENABLED,
                 "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL_SECONDS,
                 "pre_kickoff_minutes": PRE_KICKOFF_MINUTES,
+                "max_leagues_per_scan": MAX_LEAGUES_PER_SCAN,
                 "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
                 "manual_scan_url": "/scan",
                 "last_scan_summary": (
                     {
                         "checked_at": _last_scan_result.get("checked_at"),
                         "window_used": _last_scan_result.get("window_used"),
+                        "leagues_scanned": _last_scan_result.get("leagues_scanned"),
                         "matched_events_count": _last_scan_result.get("matched_events_count"),
                         "ev_selections_count": _last_scan_result.get("ev_selections_count"),
                     }
