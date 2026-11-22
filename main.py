@@ -1,7 +1,10 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs
 import psycopg2
 import requests
 
@@ -13,58 +16,305 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+AUTO_SCAN_ENABLED = os.environ.get("AUTO_SCAN_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+AUTO_SCAN_INTERVAL_SECONDS = max(60, int(os.environ.get("AUTO_SCAN_INTERVAL_SECONDS", "300")))
+PRE_KICKOFF_MINUTES = max(5.0, float(os.environ.get("PRE_KICKOFF_MINUTES", "90")))
+REGIONS = os.environ.get("ODDS_REGIONS", "uk,eu")
+MARKETS = "h2h,totals,btts"
+
+_scan_lock = threading.Lock()
+_last_scan_result = None
+
 
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=12,
+        )
+        resp.raise_for_status()
+    except Exception:
+        logger.exception("Failed to send Telegram alert")
 
 
-def run_scan() -> dict:
+def parse_iso_time(value: str):
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def format_selection_label(market_key: str, outcome_name: str, point) -> str:
+    if market_key == "totals" and point is not None:
+        return f"{outcome_name} {point}"
+    if market_key == "btts":
+        return f"BTTS {outcome_name}"
+    return outcome_name
+
+
+def fetch_soccer_events() -> list:
+    headers = {"Accept": "application/json"}
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGIONS,
+        "markets": MARKETS,
+        "oddsFormat": "decimal",
+    }
+
+    resp = requests.get(
+        "https://api.the-odds-api.com/v4/sports/soccer/odds",
+        params=params,
+        headers=headers,
+        timeout=25,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data
+
+    # Fallback: fetch active soccer league keys and query upcoming odds
+    sports_resp = requests.get(
+        "https://api.the-odds-api.com/v4/sports",
+        params={"apiKey": ODDS_API_KEY},
+        headers=headers,
+        timeout=20,
+    )
+    sports_resp.raise_for_status()
+    soccer_keys = [
+        s.get("key")
+        for s in sports_resp.json()
+        if s.get("active") and str(s.get("key", "")).startswith("soccer_")
+    ]
+
+    all_events = []
+    for key in soccer_keys[:8]:
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{key}/odds",
+            params=params,
+            headers=headers,
+            timeout=20,
+        )
+        if r.status_code == 200 and isinstance(r.json(), list):
+            all_events.extend(r.json())
+    return all_events
+
+
+def collect_ev_from_events(events: list, start_time: datetime, end_time: datetime):
+    matched_events = []
+    ev_picks = []
+
+    for event in events:
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+        label = f"{home} vs {away}"
+        commence_str = event.get("commence_time", "")
+        commence = parse_iso_time(commence_str)
+
+        if commence and not (start_time <= commence <= end_time):
+            continue
+
+        minutes_to_kickoff = (
+            round((commence - datetime.now(timezone.utc)).total_seconds() / 60.0, 1)
+            if commence
+            else None
+        )
+        matched_events.append(
+            {
+                "match": label,
+                "commence_time": commence_str,
+                "minutes_to_kickoff": minutes_to_kickoff,
+            }
+        )
+
+        line_groups = {}
+        for bm in event.get("bookmakers", []):
+            bm_title = bm.get("title") or bm.get("key") or "Bookmaker"
+            for market in bm.get("markets", []):
+                m_key = market.get("key")
+                if m_key not in ("h2h", "totals", "btts"):
+                    continue
+                for out in market.get("outcomes", []):
+                    name = out.get("name")
+                    price = out.get("price")
+                    point = out.get("point")
+                    if not name or not isinstance(price, (int, float)) or price <= 1.0:
+                        continue
+
+                    sel_label = format_selection_label(m_key, str(name), point)
+                    group_key = (m_key, point if m_key == "totals" else None)
+                    line_groups.setdefault(group_key, {}).setdefault(sel_label, []).append(
+                        (bm_title, float(price))
+                    )
+
+        for (m_key, point), outcome_odds in line_groups.items():
+            if len(outcome_odds) < 2:
+                continue
+
+            avg_implied = {}
+            for sel_label, quotes in outcome_odds.items():
+                avg_implied[sel_label] = sum(1.0 / p for _, p in quotes) / len(quotes)
+
+            overround = sum(avg_implied.values())
+            if overround <= 0:
+                continue
+
+            fair_probs = {sel_label: imp / overround for sel_label, imp in avg_implied.items()}
+
+            for sel_label, quotes in outcome_odds.items():
+                fair_p = fair_probs[sel_label]
+                fair_decimal = 1.0 / fair_p
+                for bm_title, price in quotes:
+                    ev_pct = ((price * fair_p) - 1.0) * 100.0
+                    if ev_pct > 0:
+                        pick = {
+                            "match": label,
+                            "commence_time": commence_str,
+                            "minutes_to_kickoff": minutes_to_kickoff,
+                            "market": m_key,
+                            "selection": sel_label,
+                            "bookmaker": bm_title,
+                            "odds": round(price, 2),
+                            "fair_odds": round(fair_decimal, 2),
+                            "ev_percent": round(ev_pct, 2),
+                        }
+                        if point is not None:
+                            pick["line"] = point
+                        ev_picks.append(pick)
+
+    ev_picks.sort(key=lambda x: x["ev_percent"], reverse=True)
+    return matched_events, ev_picks
+
+
+def log_to_supabase(checked_at: datetime, picks_count: int) -> None:
+    if not DATABASE_URL:
+        return
+    conn_str = DATABASE_URL
+    if "sslmode=" not in conn_str:
+        sep = "&" if "?" in conn_str else "?"
+        conn_str = f"{conn_str}{sep}sslmode=require"
+
+    with psycopg2.connect(conn_str, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scanner_runs (
+                    id SERIAL PRIMARY KEY,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    sports_count INT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "INSERT INTO scanner_runs (checked_at, sports_count) VALUES (%s, %s)",
+                (checked_at, picks_count),
+            )
+
+
+def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -> dict:
+    global _last_scan_result
     if not ODDS_API_KEY:
         return {"status": "error", "detail": "Missing ODDS_API_KEY"}
 
-    resp = requests.get(
-        "https://api.the-odds-api.com/v4/sports",
-        params={"apiKey": ODDS_API_KEY},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    sports = resp.json()
+    minutes_limit = PRE_KICKOFF_MINUTES if window_minutes is None else max(5.0, float(window_minutes))
 
-    if DATABASE_URL:
-        with psycopg2.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS scanner_runs (
-                        id SERIAL PRIMARY KEY,
-                        checked_at TIMESTAMPTZ NOT NULL,
-                        sports_count INT NOT NULL
-                    )
-                    """
-                )
-                cur.execute(
-                    "INSERT INTO scanner_runs (checked_at, sports_count) VALUES (%s, %s)",
-                    (datetime.now(timezone.utc), len(sports)),
-                )
+    with _scan_lock:
+        events = fetch_soccer_events()
+        now = datetime.now(timezone.utc)
+        window_start = now
+        primary_cutoff = now + timedelta(minutes=minutes_limit)
 
-    summary = f"EV Scanner ran at {datetime.now(timezone.utc).isoformat()} — {len(sports)} sports active."
-    send_telegram(summary)
-    return {"status": "ok", "sports_count": len(sports)}
+        matched_events, ev_picks = collect_ev_from_events(events, window_start, primary_cutoff)
+        used_window = f"next {int(minutes_limit)} mins before kickoff"
+
+        if not matched_events:
+            fallback_cutoff = now + timedelta(hours=24.0)
+            matched_events, ev_picks = collect_ev_from_events(events, window_start, fallback_cutoff)
+            used_window = "next 24h (fallback — none in pre-kickoff window)"
+
+        log_to_supabase(now, len(ev_picks))
+
+        if notify:
+            if ev_picks:
+                top = ev_picks[0]
+                msg = (
+                    f"+EV Pick ({top['market'].upper()} | {used_window}): {top['selection']} in {top['match']} "
+                    f"@ {top['odds']} on {top['bookmaker']} (+{top['ev_percent']}% EV, fair ~{top['fair_odds']})"
+                )
+            else:
+                msg = (
+                    f"Pre-kickoff scan ({used_window}): {len(matched_events)} matches checked across "
+                    f"1X2, Totals & BTTS — no +EV picks right now."
+                )
+            send_telegram(msg)
+
+        result = {
+            "status": "ok",
+            "checked_at": now.isoformat(),
+            "window_used": used_window,
+            "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
+            "matched_events_count": len(matched_events),
+            "ev_selections_count": len(ev_picks),
+            "matched_events": matched_events[:25],
+            "ev_selections": ev_picks[:30],
+        }
+        _last_scan_result = result
+        return result
+
+
+def _background_scanner_loop() -> None:
+    # Brief pause on boot so Gunicorn finishes binding to port first
+    time.sleep(10)
+    while AUTO_SCAN_ENABLED:
+        try:
+            logger.info("Running automatic pre-kickoff +EV scan...")
+            run_pre_kickoff_ev_scan(notify=True)
+        except Exception:
+            logger.exception("Automatic pre-kickoff scan failed")
+        time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+
+
+if AUTO_SCAN_ENABLED and ODDS_API_KEY:
+    worker_thread = threading.Thread(target=_background_scanner_loop, daemon=True)
+    worker_thread.start()
 
 
 def app(environ, start_response):
     path = environ.get("PATH_INFO", "/")
+    qs = parse_qs(environ.get("QUERY_STRING", ""))
     try:
         if path == "/scan":
-            result = run_scan()
-            body = json.dumps(result).encode("utf-8")
+            mins_raw = qs.get("minutes", [None])[0]
+            mins_val = float(mins_raw) if mins_raw is not None else None
+            result = run_pre_kickoff_ev_scan(window_minutes=mins_val, notify=True)
+            body = json.dumps(result, indent=2).encode("utf-8")
             start_response("200 OK", [("Content-Type", "application/json")])
             return [body]
 
-        body = json.dumps({"status": "alive", "service": "ev-scanner-public"}).encode("utf-8")
+        body = json.dumps(
+            {
+                "status": "alive",
+                "mode": "automatic pre-kickoff +EV scanner",
+                "auto_scan_enabled": AUTO_SCAN_ENABLED,
+                "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL_SECONDS,
+                "pre_kickoff_minutes": PRE_KICKOFF_MINUTES,
+                "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
+                "manual_scan_url": "/scan",
+                "last_scan_summary": (
+                    {
+                        "checked_at": _last_scan_result.get("checked_at"),
+                        "window_used": _last_scan_result.get("window_used"),
+                        "matched_events_count": _last_scan_result.get("matched_events_count"),
+                        "ev_selections_count": _last_scan_result.get("ev_selections_count"),
+                    }
+                    if _last_scan_result
+                    else None
+                ),
+            },
+            indent=2,
+        ).encode("utf-8")
         start_response("200 OK", [("Content-Type", "application/json")])
         return [body]
     except Exception as exc:
