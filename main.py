@@ -20,8 +20,10 @@ AUTO_SCAN_ENABLED = os.environ.get("AUTO_SCAN_ENABLED", "true").strip().lower() 
 AUTO_SCAN_INTERVAL_SECONDS = max(60, int(os.environ.get("AUTO_SCAN_INTERVAL_SECONDS", "300")))
 PRE_KICKOFF_MINUTES = max(5.0, float(os.environ.get("PRE_KICKOFF_MINUTES", "90")))
 MAX_LEAGUES_PER_SCAN = max(1, min(15, int(os.environ.get("MAX_LEAGUES_PER_SCAN", "6"))))
-REGIONS = os.environ.get("ODDS_REGIONS", "uk,eu")
-MARKETS = "h2h,totals,btts"
+
+_raw_regions = os.environ.get("ODDS_REGIONS", "uk,eu").strip()
+REGIONS = ",".join(part.strip() for part in _raw_regions.split(",") if part.strip()) or "uk,eu"
+MARKETS = "h2h,totals"
 
 _scan_lock = threading.Lock()
 _last_scan_result = None
@@ -51,8 +53,6 @@ def parse_iso_time(value: str):
 def format_selection_label(market_key: str, outcome_name: str, point) -> str:
     if market_key == "totals" and point is not None:
         return f"{outcome_name} {point}"
-    if market_key == "btts":
-        return f"BTTS {outcome_name}"
     return outcome_name
 
 
@@ -126,7 +126,7 @@ def fetch_soccer_events() -> tuple:
                     ev.setdefault("sport_key", key)
                     all_events.append(ev)
             else:
-                logger.warning("League %s returned status %s", key, r.status_code)
+                logger.warning("League %s returned status %s: %s", key, r.status_code, r.text[:200])
         except Exception:
             logger.exception("Failed fetching odds for league %s", key)
 
@@ -168,7 +168,7 @@ def collect_ev_from_events(events: list, start_time: datetime, end_time: datetim
             bm_title = bm.get("title") or bm.get("key") or "Bookmaker"
             for market in bm.get("markets", []):
                 m_key = market.get("key")
-                if m_key not in ("h2h", "totals", "btts"):
+                if m_key not in ("h2h", "totals"):
                     continue
                 for out in market.get("outcomes", []):
                     name = out.get("name")
@@ -285,7 +285,7 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
             else:
                 msg = (
                     f"Pre-kickoff scan ({used_window}): {len(matched_events)} matches checked across "
-                    f"{len(leagues_scanned)} leagues (1X2, Totals & BTTS) — no +EV picks right now."
+                    f"{len(leagues_scanned)} leagues (1X2 & Totals) — no +EV picks right now."
                 )
             send_telegram(msg)
 
@@ -294,7 +294,7 @@ def run_pre_kickoff_ev_scan(window_minutes: float = None, notify: bool = True) -
             "checked_at": now.isoformat(),
             "window_used": used_window,
             "leagues_scanned": leagues_scanned,
-            "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
+            "markets": ["1x2 (h2h)", "over/under (totals)"],
             "matched_events_count": len(matched_events),
             "ev_selections_count": len(ev_picks),
             "matched_events": matched_events[:30],
@@ -340,7 +340,7 @@ def app(environ, start_response):
                 "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL_SECONDS,
                 "pre_kickoff_minutes": PRE_KICKOFF_MINUTES,
                 "max_leagues_per_scan": MAX_LEAGUES_PER_SCAN,
-                "markets": ["1x2 (h2h)", "over/under (totals)", "btts"],
+                "markets": ["1x2 (h2h)", "over/under (totals)"],
                 "manual_scan_url": "/scan",
                 "last_scan_summary": (
                     {
